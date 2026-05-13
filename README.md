@@ -84,7 +84,11 @@ python main.py ask "What is the reorder policy for PPE?"
 pytest tests/ -v
 ```
 
-11 unit tests — all pass with no API calls required.
+12 unit tests — all pass with no API calls required.
+
+Note: The code will prefer the top-level `genai` package if installed, and
+fall back to `google.generativeai`. Install either package; `requirements.txt`
+includes `google-generativeai`.
 
 ---
 

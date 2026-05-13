@@ -21,7 +21,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict
 
 try:
     from dotenv import load_dotenv
@@ -29,14 +29,31 @@ try:
 except ImportError:
     pass
 
-import google.generativeai as genai
+genai = None
+try:
+    import genai as _genai
+    genai = _genai
+except Exception:
+    try:
+        import google.generativeai as _genai
+        genai = _genai
+    except Exception:
+        genai = None
 
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+if genai is not None and GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception:
+        # Ignore configuration errors during import-time; runtime will fail clearly if needed
+        pass
+
+# Flag used by tests to force fallback embeddings when True/False is toggled.
+# Default to True only if we have both the library and an API key.
+USE_OPENAI_EMBEDDINGS = bool(genai is not None and GEMINI_API_KEY)
 
 GENERATION_MODEL = "gemini-2.0-flash"
-EMBEDDING_MODEL  = "models/text-embedding-004"
+EMBEDDING_MODEL = "models/text-embedding-004"
 
 try:
     import faiss
@@ -50,7 +67,7 @@ except ImportError:
 # Chunking
 # ─────────────────────────────────────────────────────────────────────────────
 
-def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> list[str]:
+def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> List[str]:
     words = text.split()
     chunks, i = [], 0
     while i < len(words):
@@ -65,9 +82,9 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> list[str]
 # Embeddings
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _tfidf_vector(text: str, vocab: list[str]) -> list[float]:
+def _tfidf_vector(text: str, vocab: List[str]) -> List[float]:
     tokens = re.findall(r"\w+", text.lower())
-    freq: dict[str, int] = {}
+    freq: Dict[str, int] = {}
     for t in tokens:
         freq[t] = freq.get(t, 0) + 1
     vec = [float(freq.get(w, 0)) for w in vocab]
@@ -75,8 +92,8 @@ def _tfidf_vector(text: str, vocab: list[str]) -> list[float]:
     return [v / norm for v in vec]
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    if not GEMINI_API_KEY:
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    if not USE_OPENAI_EMBEDDINGS:
         vocab = list({w for t in texts for w in re.findall(r"\w+", t.lower())})
         return [_tfidf_vector(t, vocab) for t in texts]
     results = []
@@ -92,8 +109,8 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     return results
 
 
-def embed_query(query: str, vocab: Optional[list[str]] = None) -> list[float]:
-    if not GEMINI_API_KEY:
+def embed_query(query: str, vocab: Optional[List[str]] = None) -> List[float]:
+    if not USE_OPENAI_EMBEDDINGS:
         return _tfidf_vector(query, vocab or [])
     resp = genai.embed_content(
         model=EMBEDDING_MODEL,
@@ -109,13 +126,13 @@ def embed_query(query: str, vocab: Optional[list[str]] = None) -> list[float]:
 
 class VectorStore:
     def __init__(self):
-        self.chunks:  list[str]         = []
-        self.sources: list[str]         = []
-        self._matrix: list[list[float]] = []
-        self._vocab:  list[str]         = []
+        self.chunks: List[str] = []
+        self.sources: List[str] = []
+        self._matrix: List[List[float]] = []
+        self._vocab: List[str] = []
         self._index                     = None
 
-    def build(self, chunks: list[str], sources: list[str]):
+    def build(self, chunks: List[str], sources: List[str]):
         self.chunks  = chunks
         self.sources = sources
         print(f"  Embedding {len(chunks)} chunks ...")
@@ -130,7 +147,7 @@ class VectorStore:
         else:
             self._matrix = vecs
 
-    def search(self, query: str, top_k: int = 5) -> list[dict]:
+    def search(self, query: str, top_k: int = 5) -> List[Dict]:
         if not self.chunks:
             return []
         qvec = embed_query(query, self._vocab)
@@ -179,7 +196,7 @@ class VectorStore:
 # Document loader
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_docs(folder: str = "docs") -> list[tuple[str, str]]:
+def load_docs(folder: str = "docs") -> List[tuple]:
     results = []
     for p in Path(folder).rglob("*"):
         if p.suffix in {".txt", ".md"}:
