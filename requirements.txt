@@ -1,0 +1,6 @@
+google-generativeai>=0.7.0
+python-dotenv>=1.0.0
+faiss-cpu>=1.7.4
+numpy>=1.26.0
+pdfplumber>=0.10.0
+pytest>=8.0.0

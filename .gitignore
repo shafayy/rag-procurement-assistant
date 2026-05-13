@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+index.json
+docs/*.pdf
+*.egg-info/
+dist/
+.venv/
+venv/
