@@ -8,12 +8,12 @@ Built by Shafay Iqbal as a practical demonstration of RAG architecture applied t
 
 ## Stack (100% free)
 
-| Layer | Technology |
-|---|---|
-| Generation | Gemini 2.0 Flash (`google-generativeai`) |
-| Embeddings | Gemini `text-embedding-004` |
+| Layer         | Technology                                      |
+| ------------- | ----------------------------------------------- |
+| Generation    | Gemini 2.0 Flash (`google-generativeai`)        |
+| Embeddings    | Gemini `text-embedding-004`                     |
 | Vector search | FAISS (optional) or pure-Python cosine fallback |
-| PDF support | pdfplumber |
+| PDF support   | pdfplumber                                      |
 
 ---
 

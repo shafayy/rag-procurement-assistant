@@ -52,6 +52,10 @@ if genai is not None and GEMINI_API_KEY:
 # Default to True only if we have both the library and an API key.
 USE_OPENAI_EMBEDDINGS = bool(genai is not None and GEMINI_API_KEY)
 
+# Allow forcing an offline/demo-only mode via env var. When enabled, no remote
+# embedding or generation calls will be attempted.
+OFFLINE_MODE = os.getenv("OFFLINE_MODE", "").lower() in {"1", "true", "yes"}
+
 GENERATION_MODEL = "gemini-2.0-flash"
 EMBEDDING_MODEL = "models/text-embedding-004"
 
@@ -93,31 +97,59 @@ def _tfidf_vector(text: str, vocab: List[str]) -> List[float]:
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    if not USE_OPENAI_EMBEDDINGS:
+    # If embeddings are not available or configured, use TF-IDF fallback.
+    if not USE_OPENAI_EMBEDDINGS or genai is None:
         vocab = list({w for t in texts for w in re.findall(r"\w+", t.lower())})
+        embed_texts._last_vocab = vocab
         return [_tfidf_vector(t, vocab) for t in texts]
-    results = []
-    batch_size = 20
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        resp = genai.embed_content(
-            model=EMBEDDING_MODEL,
-            content=batch,
-            task_type="retrieval_document",
-        )
-        results.extend(resp["embedding"])
-    return results
+
+    # Try the remote embeddings, but gracefully fall back to TF-IDF on failure.
+    try:
+        results = []
+        batch_size = 20
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            resp = genai.embed_content(
+                model=EMBEDDING_MODEL,
+                content=batch,
+                task_type="retrieval_document",
+            )
+            # Support different response shapes across genai versions
+            if isinstance(resp, dict) and "embedding" in resp:
+                results.extend(resp["embedding"])
+            elif hasattr(resp, "embedding"):
+                results.extend(resp.embedding)
+            else:
+                # Unknown format — fallback
+                raise RuntimeError("Unexpected embedding response format")
+        # API path used — no local vocab
+        embed_texts._last_vocab = []
+        return results
+    except Exception as e:
+        print(f"  [warn] Embeddings API failed, falling back to TF-IDF: {e}")
+        vocab = list({w for t in texts for w in re.findall(r"\w+", t.lower())})
+        embed_texts._last_vocab = vocab
+        return [_tfidf_vector(t, vocab) for t in texts]
 
 
 def embed_query(query: str, vocab: Optional[List[str]] = None) -> List[float]:
-    if not USE_OPENAI_EMBEDDINGS:
+    if not USE_OPENAI_EMBEDDINGS or genai is None:
         return _tfidf_vector(query, vocab or [])
-    resp = genai.embed_content(
-        model=EMBEDDING_MODEL,
-        content=query,
-        task_type="retrieval_query",
-    )
-    return resp["embedding"]
+
+    try:
+        resp = genai.embed_content(
+            model=EMBEDDING_MODEL,
+            content=query,
+            task_type="retrieval_query",
+        )
+        if isinstance(resp, dict) and "embedding" in resp:
+            return resp["embedding"]
+        if hasattr(resp, "embedding"):
+            return resp.embedding
+        raise RuntimeError("Unexpected embedding response format")
+    except Exception as e:
+        print(f"  [warn] Embeddings API failed for query, falling back to TF-IDF: {e}")
+        return _tfidf_vector(query, vocab or [])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,7 +169,12 @@ class VectorStore:
         self.sources = sources
         print(f"  Embedding {len(chunks)} chunks ...")
         vecs = embed_texts(chunks)
-        if not GEMINI_API_KEY:
+        # If embed_texts populated a local TF-IDF vocab, use it. Otherwise
+        # fall back to deriving vocab from chunks when API is not used.
+        last_vocab = getattr(embed_texts, "_last_vocab", None)
+        if last_vocab:
+            self._vocab = last_vocab
+        elif not USE_OPENAI_EMBEDDINGS or genai is None:
             self._vocab = list({w for c in chunks for w in re.findall(r"\w+", c.lower())})
         if USE_FAISS:
             mat = np.array(vecs, dtype="float32")
@@ -241,7 +278,8 @@ class RAGAssistant:
         self.docs_folder = docs_folder
         self.index_path  = index_path
         self.history: list[dict] = []
-        self._model = genai.GenerativeModel(GENERATION_MODEL) if GEMINI_API_KEY else None
+        # Only create a remote model client if we have a key and are not in offline mode
+        self._model = genai.GenerativeModel(GENERATION_MODEL) if (genai is not None and GEMINI_API_KEY and not OFFLINE_MODE) else None
 
     def ingest(self, folder: Optional[str] = None):
         folder = folder or self.docs_folder
@@ -280,23 +318,67 @@ class RAGAssistant:
 
         gemini_history.append({"role": "user", "parts": [question]})
 
-        if not self._model:
-            print("[error] GEMINI_API_KEY not set. Add it to your .env file.")
-            return ""
+        # If offline mode is enabled or no remote model is configured, perform a
+        # simple extractive answer based on the retrieved context instead of
+        # calling the generation API.
+        if OFFLINE_MODE or not self._model:
+            # Build a concise extractive answer by selecting sentences that
+            # contain query keywords from the top results.
+            q_tokens = set(re.findall(r"\w+", question.lower()))
+            extractive_sentences = []
+            for r in results:
+                text = r["text"]
+                # split into sentences
+                sents = re.split(r'(?<=[.!?])\s+', text)
+                for s in sents:
+                    st = s.strip()
+                    if not st:
+                        continue
+                    toks = set(re.findall(r"\w+", st.lower()))
+                    if q_tokens & toks:
+                        extractive_sentences.append((st, r["source"]))
+                if len(extractive_sentences) >= 3:
+                    break
 
-        if stream:
-            print("\nAssistant: ", end="", flush=True)
-            full = ""
-            response = self._model.generate_content(gemini_history, stream=True)
-            for chunk in response:
-                text = chunk.text or ""
-                print(text, end="", flush=True)
-                full += text
-            print()
-        else:
-            response = self._model.generate_content(gemini_history)
-            full = response.text
-            print(f"\nAssistant: {full}")
+            if not extractive_sentences:
+                # fallback: use the top-k chunks truncated
+                for r in results[:3]:
+                    extractive_sentences.append((r["text"][:300].strip(), r["source"]))
+
+            answer_parts = [f"{s} (Source: {src})" for s, src in extractive_sentences]
+            full = "\n\n".join(answer_parts) if answer_parts else "No relevant information found in the documents."
+            print("\nAssistant (extractive offline):\n", full)
+            # store into history and return
+            if not self.history:
+                self.history = [
+                    {"role": "user",  "parts": [system_with_context]},
+                    {"role": "model", "parts": ["Understood. I will answer strictly from the provided context and cite sources."]},
+                ]
+            self.history.append({"role": "user",  "parts": [question]})
+            self.history.append({"role": "model", "parts": [full]})
+            return full
+
+        full = ""
+        try:
+            if stream:
+                print("\nAssistant: ", end="", flush=True)
+                response = self._model.generate_content(gemini_history, stream=True)
+                for chunk in response:
+                    text = chunk.text or ""
+                    print(text, end="", flush=True)
+                    full += text
+                print()
+            else:
+                response = self._model.generate_content(gemini_history)
+                full = getattr(response, "text", str(response))
+                print(f"\nAssistant: {full}")
+        except Exception as e:
+            # Graceful fallback when the generation API is unavailable (quota, model mismatch, etc.)
+            print(f"\n  [warn] Generation API failed: {e}")
+            # Provide an extractive fallback: show the context snippets as the assistant reply.
+            fallback = context if context else "No context available to form an answer."
+            print("\nAssistant (fallback):\n", fallback)
+            full = fallback
 
         if not self.history:
             self.history = [
