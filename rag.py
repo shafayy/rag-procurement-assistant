@@ -31,14 +31,18 @@ except ImportError:
 
 genai = None
 try:
-    import genai as _genai
+    import google.genai as _genai
     genai = _genai
 except Exception:
     try:
-        import google.generativeai as _genai
+        import genai as _genai
         genai = _genai
     except Exception:
-        genai = None
+        try:
+            import google.generativeai as _genai
+            genai = _genai
+        except Exception:
+            genai = None
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 if genai is not None and GEMINI_API_KEY:
@@ -56,8 +60,32 @@ USE_OPENAI_EMBEDDINGS = bool(genai is not None and GEMINI_API_KEY)
 # embedding or generation calls will be attempted.
 OFFLINE_MODE = os.getenv("OFFLINE_MODE", "").lower() in {"1", "true", "yes"}
 
-GENERATION_MODEL = "gemini-2.0-flash"
-EMBEDDING_MODEL = "models/text-embedding-004"
+# If a genai client can be constructed, prefer it for embeddings/generation.
+genai_client = None
+if genai is not None and GEMINI_API_KEY and not OFFLINE_MODE:
+    try:
+        # google.genai exposes Client; other packages may too
+        if hasattr(genai, 'Client'):
+            genai_client = genai.Client(api_key=GEMINI_API_KEY)
+        elif hasattr(genai, 'GenerativeModel'):
+            genai_client = None
+        else:
+            genai_client = None
+    except Exception:
+        genai_client = None
+
+# If we have a genai_client, consider embeddings enabled
+if genai_client is not None:
+    USE_OPENAI_EMBEDDINGS = True
+
+# Allow forcing an offline/demo-only mode via env var. When enabled, no remote
+# embedding or generation calls will be attempted.
+OFFLINE_MODE = os.getenv("OFFLINE_MODE", "").lower() in {"1", "true", "yes"}
+
+# Sensible defaults; will be used when the client is available. These are more
+# likely to be supported by modern `google-genai`.
+GENERATION_MODEL = os.getenv('GENERATION_MODEL', "models/gemini-2.5-flash")
+EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', "models/gemini-embedding-001")
 
 try:
     import faiss
@@ -105,6 +133,25 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 
     # Try the remote embeddings, but gracefully fall back to TF-IDF on failure.
     try:
+        # If we have a genai client (google-genai), use its embed API
+        if genai_client is not None:
+            results = []
+            batch_size = 20
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i : i + batch_size]
+                resp = genai_client.models.embed_content(model=EMBEDDING_MODEL, contents=batch)
+                # resp.embeddings -> list of objects with .values
+                if hasattr(resp, 'embeddings'):
+                    for e in resp.embeddings:
+                        vals = getattr(e, 'values', None)
+                        if vals is None and hasattr(e, 'embedding'):
+                            vals = getattr(e.embedding, 'values', None)
+                        results.append(list(vals) if vals is not None else [])
+                else:
+                    raise RuntimeError('Unexpected embed response format')
+            embed_texts._last_vocab = []
+            return results
+        # Fallback to older genai/google.generativeai API shape
         results = []
         batch_size = 20
         for i in range(0, len(texts), batch_size):
@@ -114,15 +161,12 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
                 content=batch,
                 task_type="retrieval_document",
             )
-            # Support different response shapes across genai versions
             if isinstance(resp, dict) and "embedding" in resp:
                 results.extend(resp["embedding"])
             elif hasattr(resp, "embedding"):
                 results.extend(resp.embedding)
             else:
-                # Unknown format — fallback
                 raise RuntimeError("Unexpected embedding response format")
-        # API path used — no local vocab
         embed_texts._last_vocab = []
         return results
     except Exception as e:
@@ -137,15 +181,22 @@ def embed_query(query: str, vocab: Optional[List[str]] = None) -> List[float]:
         return _tfidf_vector(query, vocab or [])
 
     try:
-        resp = genai.embed_content(
-            model=EMBEDDING_MODEL,
-            content=query,
-            task_type="retrieval_query",
-        )
-        if isinstance(resp, dict) and "embedding" in resp:
-            return resp["embedding"]
-        if hasattr(resp, "embedding"):
-            return resp.embedding
+        if genai_client is not None:
+            resp = genai_client.models.embed_content(model=EMBEDDING_MODEL, contents=[query])
+            if hasattr(resp, 'embeddings') and resp.embeddings:
+                vals = getattr(resp.embeddings[0], 'values', None)
+                if vals is not None:
+                    return list(vals)
+        else:
+            resp = genai.embed_content(
+                model=EMBEDDING_MODEL,
+                content=query,
+                task_type="retrieval_query",
+            )
+            if isinstance(resp, dict) and "embedding" in resp:
+                return resp["embedding"]
+            if hasattr(resp, "embedding"):
+                return resp.embedding
         raise RuntimeError("Unexpected embedding response format")
     except Exception as e:
         print(f"  [warn] Embeddings API failed for query, falling back to TF-IDF: {e}")
@@ -278,8 +329,16 @@ class RAGAssistant:
         self.docs_folder = docs_folder
         self.index_path  = index_path
         self.history: list[dict] = []
-        # Only create a remote model client if we have a key and are not in offline mode
-        self._model = genai.GenerativeModel(GENERATION_MODEL) if (genai is not None and GEMINI_API_KEY and not OFFLINE_MODE) else None
+        # Remote client (google-genai) or legacy model wrapper (google.generativeai)
+        self._client = genai_client
+        self._model = None
+        if genai is not None and GEMINI_API_KEY and not OFFLINE_MODE:
+            # Legacy API may expose GenerativeModel
+            if hasattr(genai, 'GenerativeModel'):
+                try:
+                    self._model = genai.GenerativeModel(GENERATION_MODEL)
+                except Exception:
+                    self._model = None
 
     def ingest(self, folder: Optional[str] = None):
         folder = folder or self.docs_folder
@@ -318,10 +377,10 @@ class RAGAssistant:
 
         gemini_history.append({"role": "user", "parts": [question]})
 
-        # If offline mode is enabled or no remote model is configured, perform a
-        # simple extractive answer based on the retrieved context instead of
-        # calling the generation API.
-        if OFFLINE_MODE or not self._model:
+        # If offline mode is enabled or no remote model/client is configured,
+        # perform a simple extractive answer based on the retrieved context
+        # instead of calling the generation API.
+        if OFFLINE_MODE or (self._client is None and self._model is None):
             # Build a concise extractive answer by selecting sentences that
             # contain query keywords from the top results.
             q_tokens = set(re.findall(r"\w+", question.lower()))
@@ -360,18 +419,57 @@ class RAGAssistant:
 
         full = ""
         try:
-            if stream:
-                print("\nAssistant: ", end="", flush=True)
-                response = self._model.generate_content(gemini_history, stream=True)
-                for chunk in response:
-                    text = chunk.text or ""
-                    print(text, end="", flush=True)
-                    full += text
-                print()
+            # Prefer new genai client streaming API when available
+            if genai_client is not None:
+                if stream and hasattr(genai_client.models, 'generate_content_stream'):
+                    print("\nAssistant: ", end="", flush=True)
+                    stream_iter = genai_client.models.generate_content_stream(model=GENERATION_MODEL, contents=[system_with_context, question])
+                    for resp in stream_iter:
+                        # resp may have .candidates with Content objects
+                        text = ''
+                        if hasattr(resp, 'candidates') and resp.candidates:
+                            cand = resp.candidates[0]
+                            cont = getattr(cand, 'content', None)
+                            if cont and hasattr(cont, 'parts'):
+                                parts = []
+                                for p in cont.parts:
+                                    parts.append(getattr(p, 'text', '') or '')
+                                text = ''.join(parts)
+                            else:
+                                text = getattr(cand, 'text', '') or ''
+                        elif hasattr(resp, 'output'):
+                            text = str(resp.output)
+                        print(text, end="", flush=True)
+                        full += text
+                    print()
+                else:
+                    resp = genai_client.models.generate_content(model=GENERATION_MODEL, contents=[system_with_context, question])
+                    # Try typical response shapes
+                    if hasattr(resp, 'candidates') and resp.candidates:
+                        cand = resp.candidates[0]
+                        cont = getattr(cand, 'content', None)
+                        if cont and hasattr(cont, 'parts'):
+                            parts = [getattr(p, 'text', '') or '' for p in cont.parts]
+                            full = ''.join(parts)
+                        else:
+                            full = getattr(cand, 'text', None) or getattr(cand, 'output', None) or str(cand)
+                    else:
+                        full = str(resp)
+                    print(f"\nAssistant: {full}")
             else:
-                response = self._model.generate_content(gemini_history)
-                full = getattr(response, "text", str(response))
-                print(f"\nAssistant: {full}")
+                # Old-style genai/generativeai model
+                if stream:
+                    print("\nAssistant: ", end="", flush=True)
+                    response = self._model.generate_content(gemini_history, stream=True)
+                    for chunk in response:
+                        text = chunk.text or ""
+                        print(text, end="", flush=True)
+                        full += text
+                    print()
+                else:
+                    response = self._model.generate_content(gemini_history)
+                    full = getattr(response, "text", str(response))
+                    print(f"\nAssistant: {full}")
         except Exception as e:
             # Graceful fallback when the generation API is unavailable (quota, model mismatch, etc.)
             print(f"\n  [warn] Generation API failed: {e}")
